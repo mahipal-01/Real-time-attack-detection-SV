@@ -8,11 +8,11 @@
 
 class OnnxModel {
 public:
-    OnnxModel(const std::string& model_path, int num_layers = 2, int d_model = 64);
+    OnnxModel(const std::string& model_path, int num_layers = 2, int d_model = 64, int num_features = 49);
     ~OnnxModel();
 
     void reset();
-    std::pair<int, float> predict(const float features[49]);
+    std::pair<int, float> predict(const float features[], int num_features);
 
 private:
     const OrtApi* ort_ = nullptr;
@@ -24,6 +24,7 @@ private:
     std::vector<float> h_states_;
     int nl_;
     int dm_;
+    int num_features_;
 
     OrtValue* input_tensors_[2];
     const char* input_names_[2];

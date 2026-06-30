@@ -9,6 +9,7 @@
 
 constexpr int WINDOW = 80;
 constexpr int NUM_FEATURES = 49;
+constexpr int NUM_FEATURES_V3 = 52;
 constexpr double I_BASE = 400.0;
 constexpr double V_BASE = 107784.0;
 constexpr double SQRT3_2 = 0.8660254037844386;
@@ -18,6 +19,7 @@ constexpr double I_MIN = 0.01;
 constexpr double OMEGA_DT = 2.0 * 3.14159265358979323846 * 50.0 / 4000.0;
 constexpr double EXPECTED_FACTOR = -2.0 * std::pow(std::sin(OMEGA_DT / 2.0), 2);
 
+// v2 scaler (5 features)
 constexpr double SCALER_MEAN[5] = {
     0.25364324809353017, 8.039491415795533,
     1.1650035727269308, 0.2536413159163042, 99.23748894505066
@@ -28,14 +30,32 @@ constexpr double SCALER_SCALE[5] = {
 };
 constexpr int SCALED_INDICES[5] = {5, 4, 3, 6, 7};
 
+// v3 scaler (8 features)
+constexpr double SCALER_MEAN_V3[8] = {
+    0.21896841433281414, 13.397994228683862,
+    0.9353995426428497, 0.21896794192210542,
+    46.70202968739074, 1.6091828585317942,
+    -4.724107087015932e-07, 10.117559072781651
+};
+constexpr double SCALER_SCALE_V3[8] = {
+    15.198948445755192, 105.10879677105765,
+    167.8147655957895, 0.9577355674993355,
+    203.37594281509115, 11.148798148309652,
+    15.183716901927628, 14.872920380029525
+};
+constexpr int SCALED_INDICES_V3[8] = {5, 4, 3, 6, 7, 49, 50, 51};
+
 struct StreamState {
-    double ring_buf[WINDOW][9];
+    double ring_buf[WINDOW][10];
     int ring_idx = 0;
     int ring_filled = 0;
 
-    double sum[9] = {0};
-    double sum_sq[9] = {0};
+    double sum[10] = {0};
+    double sum_sq[10] = {0};
     double kcl_sum = 0;
+
+    bool zero_smpCnt_ring[WINDOW]{};
+    double zero_smpCnt_sum = 0;
 
     double step_norm_total = 0;
     int step_norm_count = 0;
@@ -58,7 +78,7 @@ struct StreamState {
     double prev_Va_curv = 0;
     bool prev_curv_valid = false;
 
-    void push_sample(const double vals[9]);
+    void push_sample(const double vals[10]);
     double rms(int col) const;
     double mean(int col) const;
     double var_min(int col) const;
@@ -102,6 +122,6 @@ void compute_features(
     int smpCnt, double refrTm, double forwardTime,
     int smpSynch, int refrTmQuality,
     const std::string& src_mac,
-    float out_features[49]);
+    float out_features[], int num_features = 49);
 
 extern std::string g_baseline_src;

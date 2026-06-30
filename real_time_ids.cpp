@@ -188,7 +188,7 @@ void fast_parse_sv(const uint8_t* pkt, size_t len, double cap_time, std::vector<
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <interface> [--model s51|rwkv1] [--csv <path>] [--csv-interval <N>]\n";
+        std::cerr << "Usage: " << argv[0] << " <interface> [--model s5|s51|rwkv|rwkv1] [--csv <path>] [--csv-interval <N>]\n";
         return 1;
     }
 
@@ -211,8 +211,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::string model_path = model_name + "_streaming.onnx";
-    OnnxModel model(model_path);
+    std::string model_path;
+    int num_features = 49;
+    if (model_name == "s5") {
+        model_path = "s5_streaming.onnx";
+        num_features = 52;
+    } else if (model_name == "rwkv") {
+        model_path = "rwkv_streaming.onnx";
+        num_features = 52;
+    } else if (model_name == "rwkv1") {
+        model_path = "rwkv1_streaming.onnx";
+    } else {
+        model_path = model_name + "_streaming.onnx";
+    }
+    OnnxModel model(model_path, 2, 64, num_features);
 
     std::signal(SIGINT, signal_handler);
 
@@ -255,9 +267,7 @@ int main(int argc, char* argv[]) {
         OnnxModel* model;
         std::ofstream* csv_out;
         int csv_interval;
-        double total_sum = 0;
-        uint64_t total_count = 0;
-        double total_max = 0;
+        int num_features;
         double proc_sum = 0;
         uint64_t proc_count = 0;
         double proc_max = 0;
@@ -274,17 +284,8 @@ int main(int argc, char* argv[]) {
         double cap_time = static_cast<double>(header->ts.tv_sec) +
                           static_cast<double>(header->ts.tv_usec) / 1000000.0;
 
-        // True end-to-end latency (steady_clock calibrated to pcap timebase at first packet)
+        // Latency measured from start of decode to prediction (capture-to-decode delay excluded)
         double steady_now = std::chrono::duration<double>(clock::now().time_since_epoch()).count();
-        static double cap_at_first = 0;
-        static double steady_at_first = 0;
-        if (steady_at_first == 0) {
-            steady_at_first = steady_now;
-            cap_at_first = cap_time;
-        }
-        double cap_elapsed = (cap_time - cap_at_first) * 1e6;
-        double steady_elapsed = (steady_now - steady_at_first) * 1e6;
-        double dispatch_us = steady_elapsed - cap_elapsed;
         std::vector<ParsedRecord> records;
         fast_parse_sv(packet, header->caplen, cap_time, records);
 
@@ -297,35 +298,36 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 8; ++i) channels_double[i] = rec.channels[i];
 
             auto t_feat_start = clock::now();
-            float features[49];
+            float features[52];
             compute_features(
                 channels_double, rec.smpCnt,
                 decode_refrTm_to_seconds(rec.refrTm),
                 rec.capture_time_sec, rec.smpSynch,
                 rec.refrTm[7],
                 mac_to_string(rec.src_mac),
-                features
+                features, c->num_features
             );
             auto t_feat_end = clock::now();
             double feat_us = std::chrono::duration<double, std::micro>(t_feat_end - t_feat_start).count();
 
             auto t_ml_start = clock::now();
-            auto [pred_idx, confidence] = c->model->predict(features);
+            auto [pred_idx, confidence] = c->model->predict(features, c->num_features);
             auto t_ml_end = clock::now();
             double ml_us = std::chrono::duration<double, std::micro>(t_ml_end - t_ml_start).count();
 
             double processing_us = std::chrono::duration<double, std::micro>(t_ml_end - t_start).count();
-            double total_us = dispatch_us + processing_us;
 
             const char* prediction = CLASS_NAMES[pred_idx];
 
             c->class_counts[pred_idx]++;
 
             if (c->csv_out && c->csv_out->is_open() && *c->packet_count % c->csv_interval == 0) {
+                static int csv_nf = 0;
                 static bool csv_header_written = false;
                 if (!csv_header_written) {
+                    csv_nf = c->num_features;
                     *c->csv_out << "pkt,pred,conf";
-                    for (int i = 0; i < 49; ++i)
+                    for (int i = 0; i < csv_nf; ++i)
                         *c->csv_out << ",f" << i;
                     *c->csv_out << "\n";
                     csv_header_written = true;
@@ -333,28 +335,26 @@ int main(int argc, char* argv[]) {
                 *c->csv_out << *c->packet_count << ","
                             << pred_idx << ","
                             << std::fixed << std::setprecision(6) << confidence;
-                for (int i = 0; i < 49; ++i)
+                for (int i = 0; i < csv_nf; ++i)
                     *c->csv_out << "," << std::fixed << std::setprecision(8) << features[i];
                 *c->csv_out << "\n";
             }
 
             if (*c->packet_count > WARMUP) {
-                c->total_sum += total_us;
-                c->total_count++;
-                if (total_us > c->total_max) c->total_max = total_us;
                 c->proc_sum += processing_us;
                 c->proc_count++;
                 if (processing_us > c->proc_max) c->proc_max = processing_us;
             }
 
             if (c->prev_pred_idx != -1 && pred_idx != c->prev_pred_idx && *c->packet_count > WARMUP) {
-                set_console_color(pred_idx != 0 ? COLOR_RED : COLOR_GREEN);
+                static const Color CLASS_COLORS[4] = {COLOR_GREEN, COLOR_RED, COLOR_YELLOW, COLOR_MAGENTA};
+                set_console_color(CLASS_COLORS[pred_idx]);
                 std::cout << "[" << std::fixed << std::setprecision(3) << cap_time << "] "
                           << "Pkt#" << *c->packet_count
                           << " Pred:" << CLASS_NAMES[c->prev_pred_idx]
                           << " -> " << CLASS_NAMES[pred_idx]
                           << " Conf:" << std::setprecision(3) << confidence
-                          << " Total:" << total_us << "us"
+                          << " Latency:" << processing_us << "us"
                           << "\n";
                 set_console_color(COLOR_RESET);
             }
@@ -372,7 +372,7 @@ int main(int argc, char* argv[]) {
     }
 
     CallbackCtx ctx{&packet_count, class_counts, &true_label, &model,
-                    csv_file.is_open() ? &csv_file : nullptr, csv_interval};
+                    csv_file.is_open() ? &csv_file : nullptr, csv_interval, num_features};
     pcap_loop(global_pcap_handle, 0, packet_handler, reinterpret_cast<u_char*>(&ctx));
 
     if (global_pcap_handle) {
@@ -383,13 +383,10 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[Summary] Packets processed: " << packet_count
               << " | Predictions: " << packet_count
               << " | Alerts: " << total_alerts;
-    if (ctx.total_count > 0) {
-        double avg_total = ctx.total_sum / ctx.total_count;
+    if (ctx.proc_count > 0) {
         double avg_proc = ctx.proc_sum / ctx.proc_count;
-        std::cout << " | Avg Proc: " << std::fixed << std::setprecision(1) << avg_proc << "us"
-                  << " | Max Proc: " << ctx.proc_max << "us"
-                  << " | Avg Total: " << avg_total << "us"
-                  << " | Max Total: " << ctx.total_max << "us";
+        std::cout << " | Avg Latency: " << std::fixed << std::setprecision(1) << avg_proc << "us"
+                  << " | Max Latency: " << ctx.proc_max << "us";
     }
     std::cout << "\n";
     for (int i = 0; i < 4; ++i)

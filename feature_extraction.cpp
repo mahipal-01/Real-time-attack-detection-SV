@@ -6,17 +6,17 @@
 
 std::string g_baseline_src;
 
-void StreamState::push_sample(const double vals[9]) {
+void StreamState::push_sample(const double vals[10]) {
     if (ring_filled == WINDOW) {
         double* old = ring_buf[ring_idx];
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 10; ++i) {
             sum[i] -= old[i];
             sum_sq[i] -= old[i] * old[i];
         }
         kcl_sum -= std::abs(old[0] + old[1] + old[2] - old[6]);
     }
-    std::memcpy(ring_buf[ring_idx], vals, sizeof(double) * 9);
-    for (int i = 0; i < 9; ++i) {
+    std::memcpy(ring_buf[ring_idx], vals, sizeof(double) * 10);
+    for (int i = 0; i < 10; ++i) {
         sum[i] += vals[i];
         sum_sq[i] += vals[i] * vals[i];
     }
@@ -60,7 +60,7 @@ void compute_features(
     int smpCnt, double refrTm, double forwardTime,
     int smpSynch, int refrTmQuality,
     const std::string& src_mac,
-    float out_features[49])
+    float out_features[], int num_features)
 {
     static StreamState s;
 
@@ -72,7 +72,7 @@ void compute_features(
     double vb_pu = channels[5] / V_BASE;
     double vc_pu = channels[6] / V_BASE;
 
-    double f[49] = {0};
+    double f[52] = {0};
 
     if (g_baseline_src.empty())
         g_baseline_src = src_mac;
@@ -236,8 +236,18 @@ void compute_features(
         s.prev_curv_valid = true;
     }
 
-    // Store sample in ring buffer before window stats
-    double sample[9] = {ia_pu, ib_pu, ic_pu, va_pu, vb_pu, vc_pu, in_pu, step_norm, phi_VI};
+    // Track smpCnt_zero for v3 rolling feature
+    double is_smpCnt_zero = (f[3] == 0.0) ? 1.0 : 0.0;
+    if (s.ring_filled == WINDOW) {
+        int old_idx = s.ring_idx;
+        if (s.zero_smpCnt_ring[old_idx])
+            s.zero_smpCnt_sum -= 1.0;
+    }
+    s.zero_smpCnt_ring[s.ring_idx] = (is_smpCnt_zero > 0.5);
+    s.zero_smpCnt_sum += is_smpCnt_zero;
+
+    // Store sample in ring buffer before window stats (col 9 = forward_time_diff)
+    double sample[10] = {ia_pu, ib_pu, ic_pu, va_pu, vb_pu, vc_pu, in_pu, step_norm, phi_VI, f[6]};
     s.push_sample(sample);
 
     // Window features (O(1) via running sums)
@@ -281,10 +291,30 @@ void compute_features(
     }
     f[46] = (double)s.anomaly_streak;
 
-    // Scaler normalization for 5 features
-    for (int i = 0; i < 5; ++i) {
-        int idx = SCALED_INDICES[i];
-        f[idx] = (f[idx] - SCALER_MEAN[i]) / SCALER_SCALE[i];
+    // f[49]: smpCnt_zero_roll80 — rolling count of smpCnt_diff==0 in window
+    f[49] = s.zero_smpCnt_sum;
+
+    // f[50]: fwd_refrTm_delta — forward_time_diff - refrTm_diff
+    f[50] = f[6] - f[5];
+
+    // f[51]: pkt_rate_80 — 80 / sum(forward_time_diff over window), clipped [0,500]
+    if (s.ring_filled > 0) {
+        double fwd_sum = s.sum[9];
+        double span = std::max(fwd_sum, 1e-6);
+        f[51] = std::min(80.0 / span, 500.0);
+    }
+
+    // Scaler normalization (v2 or v3 depending on feature count)
+    if (num_features == NUM_FEATURES_V3) {
+        for (int i = 0; i < 8; ++i) {
+            int idx = SCALED_INDICES_V3[i];
+            f[idx] = (f[idx] - SCALER_MEAN_V3[i]) / SCALER_SCALE_V3[i];
+        }
+    } else {
+        for (int i = 0; i < 5; ++i) {
+            int idx = SCALED_INDICES[i];
+            f[idx] = (f[idx] - SCALER_MEAN[i]) / SCALER_SCALE[i];
+        }
     }
 
     // Update state
@@ -296,6 +326,7 @@ void compute_features(
     s.last_Za_mag = Za_mag;
 
     // Copy to output
-    for (int i = 0; i < 49; ++i)
+    int nf = (num_features == NUM_FEATURES_V3) ? NUM_FEATURES_V3 : NUM_FEATURES;
+    for (int i = 0; i < nf; ++i)
         out_features[i] = std::isfinite(f[i]) ? (float)f[i] : 0.0f;
 }

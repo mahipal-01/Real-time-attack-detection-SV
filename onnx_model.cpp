@@ -13,8 +13,8 @@
     } \
 } while (0)
 
-OnnxModel::OnnxModel(const std::string& model_path, int num_layers, int d_model)
-    : nl_(num_layers), dm_(d_model) {
+OnnxModel::OnnxModel(const std::string& model_path, int num_layers, int d_model, int num_features)
+    : nl_(num_layers), dm_(d_model), num_features_(num_features) {
 
     ort_ = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     if (!ort_) throw std::runtime_error("Failed to get ONNX Runtime API");
@@ -51,10 +51,11 @@ void OnnxModel::reset() {
     h_states_.assign(nl_ * dm_, 0.0f);
 }
 
-std::pair<int, float> OnnxModel::predict(const float features[49]) {
-    // Input shape: {1, 49}
-    int64_t input_shape[] = {1, 49};
-    size_t input_bytes = 49 * sizeof(float);
+std::pair<int, float> OnnxModel::predict(const float features[], int num_features) {
+    int nf = num_features;
+    // Input shape: {1, nf}
+    int64_t input_shape[] = {1, nf};
+    size_t input_bytes = nf * sizeof(float);
 
     ORT_ABORT(ort_->CreateTensorWithDataAsOrtValue(
         memory_info_, const_cast<float*>(features), input_bytes,
