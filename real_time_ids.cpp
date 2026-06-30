@@ -1,0 +1,399 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <mutex>
+#include <chrono>
+#include <iomanip>
+#include <csignal>
+#include <pcap.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#endif
+
+#include "feature_extraction.h"
+#include "onnx_model.h"
+
+constexpr uint16_t SV_ETHERTYPE = 0x88BA;
+constexpr uint16_t VLAN_ETHERTYPE = 0x8100;
+constexpr int WARMUP = 80;
+
+constexpr const char* CLASS_NAMES[4] = {
+    "normal", "manipulation", "timing/protocol", "traffic"
+};
+
+pcap_t* global_pcap_handle = nullptr;
+
+void signal_handler(int) {
+    if (global_pcap_handle) {
+        std::cout << "\n[Info] Stop signal received.\n";
+        pcap_breakloop(global_pcap_handle);
+        global_pcap_handle = nullptr;
+    }
+}
+
+#ifdef _WIN32
+enum Color {
+    COLOR_RESET = 7, COLOR_RED = 12, COLOR_GREEN = 10,
+    COLOR_YELLOW = 14, COLOR_CYAN = 11, COLOR_MAGENTA = 13, COLOR_WHITE = 15,
+};
+
+void set_console_color(Color c) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(h, c);
+}
+#else
+void set_console_color(int) {}
+#endif
+
+inline float read_float_be(const uint8_t* p) {
+    uint32_t raw = (static_cast<uint32_t>(p[0]) << 24) |
+                   (static_cast<uint32_t>(p[1]) << 16) |
+                   (static_cast<uint32_t>(p[2]) << 8) |
+                   static_cast<uint32_t>(p[3]);
+    float value = 0.0f;
+    std::memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+inline uint32_t read_u32_be(const uint8_t* p, size_t len) {
+    uint32_t value = 0;
+    size_t parse_len = std::min(len, static_cast<size_t>(4));
+    for (size_t i = 0; i < parse_len; ++i) value = (value << 8) | p[i];
+    return value;
+}
+
+inline bool read_ber_length(const uint8_t* data, size_t max_len, size_t& offset, size_t& length) {
+    if (offset >= max_len) return false;
+    uint8_t first = data[offset++];
+    if (first < 0x80) { length = first; return true; }
+    size_t count = first & 0x7F;
+    if (count == 0 || offset + count > max_len || count > 4) return false;
+    length = 0;
+    for (size_t i = 0; i < count; ++i) length = (length << 8) | data[offset++];
+    return true;
+}
+
+inline double decode_refrTm_to_seconds(const uint8_t* refrTm) {
+    uint32_t seconds = (static_cast<uint32_t>(refrTm[0]) << 24) |
+                       (static_cast<uint32_t>(refrTm[1]) << 16) |
+                       (static_cast<uint32_t>(refrTm[2]) << 8) |
+                       static_cast<uint32_t>(refrTm[3]);
+    uint32_t fraction = (static_cast<uint32_t>(refrTm[4]) << 16) |
+                        (static_cast<uint32_t>(refrTm[5]) << 8) |
+                        static_cast<uint32_t>(refrTm[6]);
+    return static_cast<double>(seconds) + (static_cast<double>(fraction) / 16777216.0);
+}
+
+void fast_parse_sv(const uint8_t* pkt, size_t len, double cap_time, std::vector<ParsedRecord>& records) {
+    if (len < 22) return;
+
+    ParsedRecord base_record;
+    base_record.capture_time_sec = cap_time;
+    std::memcpy(base_record.dst_mac, pkt, 6);
+    std::memcpy(base_record.src_mac, pkt + 6, 6);
+
+    size_t offset = 12;
+    uint16_t ethertype = (pkt[offset] << 8) | pkt[offset + 1];
+    offset += 2;
+
+    if (ethertype == VLAN_ETHERTYPE) {
+        if (len < 26) return;
+        base_record.has_vlan = true;
+        uint16_t tci = (pkt[offset] << 8) | pkt[offset + 1];
+        base_record.vlan_priority = (tci >> 13) & 0x07;
+        base_record.vlan_id = tci & 0x0FFF;
+        offset += 2;
+        ethertype = (pkt[offset] << 8) | pkt[offset + 1];
+        offset += 2;
+    }
+
+    if (ethertype != SV_ETHERTYPE || offset + 8 > len) return;
+
+    base_record.app_id = (pkt[offset] << 8) | pkt[offset + 1];
+    base_record.length = (pkt[offset + 2] << 8) | pkt[offset + 3];
+    base_record.reserved1 = (pkt[offset + 4] << 8) | pkt[offset + 5];
+    base_record.reserved2 = (pkt[offset + 6] << 8) | pkt[offset + 7];
+    offset += 8;
+
+    if (offset >= len || pkt[offset] != 0x60) return;
+    offset++;
+
+    size_t apdu_len;
+    if (!read_ber_length(pkt, len, offset, apdu_len)) return;
+    size_t apdu_end = std::min(len, offset + apdu_len);
+
+    while (offset < apdu_end) {
+        uint8_t tag = pkt[offset++];
+        size_t tlv_len;
+        if (!read_ber_length(pkt, apdu_end, offset, tlv_len)) break;
+        size_t val_offset = offset;
+        offset += tlv_len;
+
+        if (tag == 0x80) {
+            base_record.noAsdu = read_u32_be(pkt + val_offset, tlv_len);
+        } else if (tag == 0xA2) {
+            size_t seq_off = val_offset;
+            while (seq_off < val_offset + tlv_len) {
+                uint8_t seq_tag = pkt[seq_off++];
+                size_t asdu_len;
+                if (!read_ber_length(pkt, val_offset + tlv_len, seq_off, asdu_len)) break;
+                if (seq_tag == 0x30) {
+                    ParsedRecord asdu_rec = base_record;
+                    size_t inner = seq_off;
+                    while (inner < seq_off + asdu_len) {
+                        uint8_t in_tag = pkt[inner++];
+                        size_t in_len;
+                        if (!read_ber_length(pkt, seq_off + asdu_len, inner, in_len)) break;
+                        switch (in_tag) {
+                            case 0x80: std::memcpy(asdu_rec.svID, pkt + inner, std::min(in_len, sizeof(asdu_rec.svID) - 1)); break;
+                            case 0x81: std::memcpy(asdu_rec.DatSet, pkt + inner, std::min(in_len, sizeof(asdu_rec.DatSet) - 1)); break;
+                            case 0x82: asdu_rec.smpCnt = read_u32_be(pkt + inner, in_len); break;
+                            case 0x83: asdu_rec.confrev = read_u32_be(pkt + inner, in_len); break;
+                            case 0x84: std::memcpy(asdu_rec.refrTm, pkt + inner, std::min(in_len, sizeof(asdu_rec.refrTm))); break;
+                            case 0x85: asdu_rec.smpSynch = read_u32_be(pkt + inner, in_len); break;
+                            case 0x86: asdu_rec.smpRate = read_u32_be(pkt + inner, in_len); break;
+                            case 0x87: {
+                                size_t count = std::min(static_cast<size_t>(8), in_len / 8);
+                                for (size_t i = 0; i < count; ++i) {
+                                    size_t ch_offset = inner + (i * 8);
+                                    asdu_rec.channels[i] = read_float_be(pkt + ch_offset);
+                                    asdu_rec.quality[i] = read_u32_be(pkt + ch_offset + 4, 4);
+                                }
+                                asdu_rec.valid = true;
+                                break;
+                            }
+                        }
+                        inner += in_len;
+                    }
+                    if (asdu_rec.valid) records.push_back(asdu_rec);
+                }
+                seq_off += asdu_len;
+            }
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <interface> [--model s51|rwkv1] [--csv <path>] [--csv-interval <N>]\n";
+        return 1;
+    }
+
+    std::string iface = argv[1];
+    std::string model_name = "s51";
+    std::string true_label = "N/A";
+    std::string csv_path;
+    int csv_interval = 1;
+
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--true-label") == 0 && i + 1 < argc) {
+            true_label = argv[++i];
+        } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model_name = argv[++i];
+        } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            csv_path = argv[++i];
+        } else if (strcmp(argv[i], "--csv-interval") == 0 && i + 1 < argc) {
+            csv_interval = std::stoi(argv[++i]);
+            if (csv_interval < 1) csv_interval = 1;
+        }
+    }
+
+    std::string model_path = model_name + "_streaming.onnx";
+    OnnxModel model(model_path);
+
+    std::signal(SIGINT, signal_handler);
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    global_pcap_handle = pcap_create(iface.c_str(), errbuf);
+    if (!global_pcap_handle) {
+        std::cerr << "[Error] pcap_create: " << errbuf << "\n";
+        return 1;
+    }
+
+    pcap_set_snaplen(global_pcap_handle, 65535);
+    pcap_set_promisc(global_pcap_handle, 1);
+    pcap_set_timeout(global_pcap_handle, 1);
+    pcap_set_immediate_mode(global_pcap_handle, 1);
+    pcap_set_buffer_size(global_pcap_handle, 1024 * 1024 * 10);
+
+    int status = pcap_activate(global_pcap_handle);
+    if (status != 0) {
+        std::cerr << "[Error] pcap_activate: " << pcap_statustostr(status) << "\n";
+        pcap_close(global_pcap_handle);
+        return 1;
+    }
+
+    int linktype = pcap_datalink(global_pcap_handle);
+    if (linktype != DLT_EN10MB) {
+        std::cerr << "[Warning] Expected Ethernet (" << DLT_EN10MB << "), got " << linktype << "\n";
+    }
+
+    std::cout << "Listening on " << iface
+              << " (model: " << model_name << ")\n"
+              << "Press Ctrl+C to stop.\n\n";
+
+    uint64_t packet_count = 0;
+    uint64_t class_counts[4] = {0};
+
+    struct CallbackCtx {
+        uint64_t* packet_count;
+        uint64_t* class_counts;
+        std::string* true_label;
+        OnnxModel* model;
+        std::ofstream* csv_out;
+        int csv_interval;
+        double total_sum = 0;
+        uint64_t total_count = 0;
+        double total_max = 0;
+        double proc_sum = 0;
+        uint64_t proc_count = 0;
+        double proc_max = 0;
+        int prev_pred_idx = -1;
+    };
+
+    static auto packet_handler = +[](u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
+        CallbackCtx* c = reinterpret_cast<CallbackCtx*>(user);
+
+        using clock = std::chrono::high_resolution_clock;
+
+        auto t_start = clock::now();
+
+        double cap_time = static_cast<double>(header->ts.tv_sec) +
+                          static_cast<double>(header->ts.tv_usec) / 1000000.0;
+
+        // True end-to-end latency (steady_clock calibrated to pcap timebase at first packet)
+        double steady_now = std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+        static double cap_at_first = 0;
+        static double steady_at_first = 0;
+        if (steady_at_first == 0) {
+            steady_at_first = steady_now;
+            cap_at_first = cap_time;
+        }
+        double cap_elapsed = (cap_time - cap_at_first) * 1e6;
+        double steady_elapsed = (steady_now - steady_at_first) * 1e6;
+        double dispatch_us = steady_elapsed - cap_elapsed;
+        std::vector<ParsedRecord> records;
+        fast_parse_sv(packet, header->caplen, cap_time, records);
+
+        if (records.empty()) return;
+
+        for (const auto& rec : records) {
+            (*c->packet_count)++;
+
+            double channels_double[8];
+            for (int i = 0; i < 8; ++i) channels_double[i] = rec.channels[i];
+
+            auto t_feat_start = clock::now();
+            float features[49];
+            compute_features(
+                channels_double, rec.smpCnt,
+                decode_refrTm_to_seconds(rec.refrTm),
+                rec.capture_time_sec, rec.smpSynch,
+                rec.refrTm[7],
+                mac_to_string(rec.src_mac),
+                features
+            );
+            auto t_feat_end = clock::now();
+            double feat_us = std::chrono::duration<double, std::micro>(t_feat_end - t_feat_start).count();
+
+            auto t_ml_start = clock::now();
+            auto [pred_idx, confidence] = c->model->predict(features);
+            auto t_ml_end = clock::now();
+            double ml_us = std::chrono::duration<double, std::micro>(t_ml_end - t_ml_start).count();
+
+            double processing_us = std::chrono::duration<double, std::micro>(t_ml_end - t_start).count();
+            double total_us = dispatch_us + processing_us;
+
+            const char* prediction = CLASS_NAMES[pred_idx];
+
+            c->class_counts[pred_idx]++;
+
+            if (c->csv_out && c->csv_out->is_open() && *c->packet_count % c->csv_interval == 0) {
+                static bool csv_header_written = false;
+                if (!csv_header_written) {
+                    *c->csv_out << "pkt,pred,conf";
+                    for (int i = 0; i < 49; ++i)
+                        *c->csv_out << ",f" << i;
+                    *c->csv_out << "\n";
+                    csv_header_written = true;
+                }
+                *c->csv_out << *c->packet_count << ","
+                            << pred_idx << ","
+                            << std::fixed << std::setprecision(6) << confidence;
+                for (int i = 0; i < 49; ++i)
+                    *c->csv_out << "," << std::fixed << std::setprecision(8) << features[i];
+                *c->csv_out << "\n";
+            }
+
+            if (*c->packet_count > WARMUP) {
+                c->total_sum += total_us;
+                c->total_count++;
+                if (total_us > c->total_max) c->total_max = total_us;
+                c->proc_sum += processing_us;
+                c->proc_count++;
+                if (processing_us > c->proc_max) c->proc_max = processing_us;
+            }
+
+            if (c->prev_pred_idx != -1 && pred_idx != c->prev_pred_idx && *c->packet_count > WARMUP) {
+                set_console_color(pred_idx != 0 ? COLOR_RED : COLOR_GREEN);
+                std::cout << "[" << std::fixed << std::setprecision(3) << cap_time << "] "
+                          << "Pkt#" << *c->packet_count
+                          << " Pred:" << CLASS_NAMES[c->prev_pred_idx]
+                          << " -> " << CLASS_NAMES[pred_idx]
+                          << " Conf:" << std::setprecision(3) << confidence
+                          << " Total:" << total_us << "us"
+                          << "\n";
+                set_console_color(COLOR_RESET);
+            }
+            c->prev_pred_idx = pred_idx;
+        }
+    };
+
+    std::ofstream csv_file;
+    if (!csv_path.empty()) {
+        csv_file.open(csv_path);
+        if (!csv_file.is_open())
+            std::cerr << "[Warning] Failed to open " << csv_path << " for writing\n";
+        else
+            std::cout << "Dumping features to " << csv_path << " (every " << csv_interval << " packets)\n";
+    }
+
+    CallbackCtx ctx{&packet_count, class_counts, &true_label, &model,
+                    csv_file.is_open() ? &csv_file : nullptr, csv_interval};
+    pcap_loop(global_pcap_handle, 0, packet_handler, reinterpret_cast<u_char*>(&ctx));
+
+    if (global_pcap_handle) {
+        pcap_close(global_pcap_handle);
+    }
+
+    uint64_t total_alerts = class_counts[1] + class_counts[2] + class_counts[3];
+    std::cout << "\n[Summary] Packets processed: " << packet_count
+              << " | Predictions: " << packet_count
+              << " | Alerts: " << total_alerts;
+    if (ctx.total_count > 0) {
+        double avg_total = ctx.total_sum / ctx.total_count;
+        double avg_proc = ctx.proc_sum / ctx.proc_count;
+        std::cout << " | Avg Proc: " << std::fixed << std::setprecision(1) << avg_proc << "us"
+                  << " | Max Proc: " << ctx.proc_max << "us"
+                  << " | Avg Total: " << avg_total << "us"
+                  << " | Max Total: " << ctx.total_max << "us";
+    }
+    std::cout << "\n";
+    for (int i = 0; i < 4; ++i)
+        std::cout << "  " << CLASS_NAMES[i] << ": " << class_counts[i] << "\n";
+
+    return 0;
+}
