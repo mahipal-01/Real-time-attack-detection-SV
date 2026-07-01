@@ -23,8 +23,12 @@
 #include <sys/types.h>
 #endif
 
+#include <unordered_map>
+
 #include "feature_extraction.h"
 #include "onnx_model.h"
+#include "kalman.h"
+#include "timing_reconstruct.h"
 
 constexpr uint16_t SV_ETHERTYPE = 0x88BA;
 constexpr uint16_t VLAN_ETHERTYPE = 0x8100;
@@ -188,7 +192,9 @@ void fast_parse_sv(const uint8_t* pkt, size_t len, double cap_time, std::vector<
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <interface> [--model s5|s51|rwkv|rwkv1] [--csv <path>] [--csv-interval <N>]\n";
+        std::cerr << "Usage: " << argv[0] << " <interface> [--model s5|s51|rwkv|rwkv1] [--csv <path>] [--csv-interval <N>]\n"
+                  << "       [--mitigation] [--kalman-thresh <F>] [--kalman-Qa <F>] [--kalman-R <F>]\n"
+                  << "       [--flood-sustain <N>] [--flood-recover-rate <F>] [--flood-check <N>]\n";
         return 1;
     }
 
@@ -197,6 +203,14 @@ int main(int argc, char* argv[]) {
     std::string true_label = "N/A";
     std::string csv_path;
     int csv_interval = 1;
+    bool mitigation_enabled = false;
+    double kalman_thresh = 0.05;
+    double kalman_q_amp = 1e-6;
+    double kalman_q_dc = 1e-8;
+    double kalman_r_meas = 1e-4;
+    int flood_sustain = 150;
+    double flood_recover_rate = 6.0;
+    int flood_check_interval = 1000;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--true-label") == 0 && i + 1 < argc) {
@@ -208,6 +222,21 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--csv-interval") == 0 && i + 1 < argc) {
             csv_interval = std::stoi(argv[++i]);
             if (csv_interval < 1) csv_interval = 1;
+        } else if (strcmp(argv[i], "--mitigation") == 0) {
+            mitigation_enabled = true;
+        } else if (strcmp(argv[i], "--kalman-thresh") == 0 && i + 1 < argc) {
+            kalman_thresh = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--kalman-Qa") == 0 && i + 1 < argc) {
+            kalman_q_amp = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--kalman-R") == 0 && i + 1 < argc) {
+            kalman_r_meas = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--flood-sustain") == 0 && i + 1 < argc) {
+            flood_sustain = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--flood-recover-rate") == 0 && i + 1 < argc) {
+            flood_recover_rate = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--flood-check") == 0 && i + 1 < argc) {
+            flood_check_interval = std::stoi(argv[++i]);
+            if (flood_check_interval < 1) flood_check_interval = 1;
         }
     }
 
@@ -225,6 +254,7 @@ int main(int argc, char* argv[]) {
         model_path = model_name + "_streaming.onnx";
     }
     OnnxModel model(model_path, 2, 64, num_features);
+    KalmanManager kalman_mgr(kalman_thresh, kalman_q_amp, kalman_q_dc, kalman_r_meas);
 
     std::signal(SIGINT, signal_handler);
 
@@ -255,7 +285,15 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Listening on " << iface
               << " (model: " << model_name << ")\n"
-              << "Press Ctrl+C to stop.\n\n";
+              << "Mitigation: " << (mitigation_enabled ? "ON" : "OFF") << "\n";
+    if (mitigation_enabled) {
+        std::cout << "  Kalman: thresh=" << kalman_thresh
+                  << " Qa=" << kalman_q_amp << " R=" << kalman_r_meas << "\n"
+                  << "  Flood: sustain=" << flood_sustain
+                  << " recover_rate=" << flood_recover_rate
+                  << " check_interval=" << flood_check_interval << "\n";
+    }
+    std::cout << "Press Ctrl+C to stop.\n\n";
 
     uint64_t packet_count = 0;
     uint64_t class_counts[4] = {0};
@@ -272,6 +310,18 @@ int main(int argc, char* argv[]) {
         uint64_t proc_count = 0;
         double proc_max = 0;
         int prev_pred_idx = -1;
+        KalmanManager* kalman = nullptr;
+        std::unordered_map<std::string, TimingReconstructor>* timing_recons = nullptr;
+        bool mitigation_enabled = false;
+        bool flood_skip_active = false;
+        int traffic_count = 0;
+        uint64_t flood_pkt_count = 0;
+        double flood_check_time = 0.0;
+        double flood_last_print_time = 0.0;
+        double flood_rate = 0.0;
+        int flood_sustain = 0;
+        double flood_recover_rate = 0.0;
+        int flood_check_interval = 0;
     };
 
     static auto packet_handler = +[](u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
@@ -293,6 +343,30 @@ int main(int argc, char* argv[]) {
 
         for (const auto& rec : records) {
             (*c->packet_count)++;
+
+            // Flood skip mode: bypass feature extraction and ML entirely
+            if (c->flood_skip_active) {
+                c->flood_pkt_count++;
+                if (c->flood_pkt_count % c->flood_check_interval == 0) {
+                    double now = std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+                    double elapsed = now - c->flood_check_time;
+                    if (elapsed > 0) {
+                        double rate = static_cast<double>(c->flood_check_interval) / elapsed;
+                        c->flood_rate = rate;
+                        if (rate < c->flood_recover_rate || rate <= 5000.0) {
+                            c->flood_skip_active = false;
+                            c->traffic_count = 0;
+                            std::cout << "[Info] Flood ended. Resuming full processing.\n";
+                        } else if (now - c->flood_last_print_time >= 1.0) {
+                            c->flood_last_print_time = now;
+                            std::cout << "[FLOOD ACTIVE] rate:" << static_cast<int>(rate) << "/s\n";
+                        }
+                    }
+                    c->flood_check_time = now;
+                    c->flood_pkt_count = 0;
+                }
+                continue;
+            }
 
             double channels_double[8];
             for (int i = 0; i < 8; ++i) channels_double[i] = rec.channels[i];
@@ -316,6 +390,54 @@ int main(int argc, char* argv[]) {
             double ml_us = std::chrono::duration<double, std::micro>(t_ml_end - t_ml_start).count();
 
             double processing_us = std::chrono::duration<double, std::micro>(t_ml_end - t_start).count();
+
+            // Timing reconstruction
+            TimingResult timing_result;
+            bool is_replay = false;
+            if (c->mitigation_enabled && c->timing_recons) {
+                std::string src_mac = mac_to_string(rec.src_mac);
+                TimingReconstructor& tr = (*c->timing_recons)[src_mac];
+                double refrTm_sec = decode_refrTm_to_seconds(rec.refrTm);
+                timing_result = tr.process(
+                    rec.smpCnt, refrTm_sec,
+                    rec.refrTm[7], rec.smpSynch,
+                    features[3], features[4],
+                    features[1], features[2],
+                    pred_idx == 2
+                );
+                is_replay = (timing_result.type == TimingAttackType::REPLAY);
+            }
+
+            // Kalman reconstruction check (manipulation OR replay timing)
+            bool kalman_active = false;
+            if (c->mitigation_enabled && c->kalman && *c->packet_count > 160) {
+                double pu_channels[6] = {
+                    channels_double[0] / I_BASE,
+                    channels_double[1] / I_BASE,
+                    channels_double[2] / I_BASE,
+                    channels_double[4] / V_BASE,
+                    channels_double[5] / V_BASE,
+                    channels_double[6] / V_BASE,
+                };
+                kalman_active = c->kalman->process(pu_channels, pred_idx == 1 || is_replay);
+            }
+
+            // Traffic flood detection (when mitigation enabled)
+            if (c->mitigation_enabled) {
+                if (pred_idx == 3) {
+                    c->traffic_count++;
+                    if (c->traffic_count >= c->flood_sustain) {
+                        c->flood_skip_active = true;
+                        c->flood_pkt_count = 0;
+                        c->flood_check_time = std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+                        c->flood_last_print_time = c->flood_check_time;
+                        c->traffic_count = 0;
+                        std::cout << "[Info] Flood detected. Entering skip mode.\n";
+                    }
+                } else {
+                    c->traffic_count = 0;
+                }
+            }
 
             const char* prediction = CLASS_NAMES[pred_idx];
 
@@ -349,13 +471,46 @@ int main(int argc, char* argv[]) {
             if (c->prev_pred_idx != -1 && pred_idx != c->prev_pred_idx && *c->packet_count > WARMUP) {
                 static const Color CLASS_COLORS[4] = {COLOR_GREEN, COLOR_RED, COLOR_YELLOW, COLOR_MAGENTA};
                 set_console_color(CLASS_COLORS[pred_idx]);
-                std::cout << "[" << std::fixed << std::setprecision(3) << cap_time << "] "
-                          << "Pkt#" << *c->packet_count
+                std::cout << "[" << std::fixed << std::setprecision(3) << cap_time << "] ";
+                if (timing_result.type == TimingAttackType::REPLAY)
+                    std::cout << "[REPLAY] ";
+                else if (timing_result.type == TimingAttackType::SEQ_MANIP)
+                    std::cout << "[SEQ MANIP] ";
+                else if (timing_result.type == TimingAttackType::TIME_SYNC)
+                    std::cout << "[TIME SYNC] ";
+                else if (timing_result.type == TimingAttackType::UNKNOWN)
+                    std::cout << "[TIMING] ";
+                if (kalman_active)
+                    std::cout << "[RECONSTRUCTING] ";
+                std::cout << "Pkt#" << *c->packet_count
                           << " Pred:" << CLASS_NAMES[c->prev_pred_idx]
                           << " -> " << CLASS_NAMES[pred_idx]
-                          << " Conf:" << std::setprecision(3) << confidence
-                          << " Latency:" << processing_us << "us"
-                          << "\n";
+                          << " Conf:" << std::setprecision(3) << confidence;
+                // Timing correction display
+                if (timing_result.type == TimingAttackType::REPLAY) {
+                    double refrTm_sec = decode_refrTm_to_seconds(rec.refrTm);
+                    std::cout << " smpCnt:" << rec.smpCnt
+                              << "->" << timing_result.recon_smpCnt
+                              << " refrTm:" << std::setprecision(6) << refrTm_sec
+                              << "->" << timing_result.recon_refrTm_seconds;
+                } else if (timing_result.type == TimingAttackType::SEQ_MANIP) {
+                    std::cout << " smpCnt:" << rec.smpCnt
+                              << "->" << timing_result.recon_smpCnt;
+                } else if (timing_result.type == TimingAttackType::TIME_SYNC) {
+                    double refrTm_sec = decode_refrTm_to_seconds(rec.refrTm);
+                    std::cout << " refrTm:" << std::setprecision(6) << refrTm_sec
+                              << "->" << timing_result.recon_refrTm_seconds;
+                    if (timing_result.quality_suspicious) std::cout << " quality:suspicious";
+                    if (timing_result.synch_suspicious) std::cout << " synch:suspicious";
+                }
+                // Kalman correction display
+                if (kalman_active && c->kalman) {
+                    std::cout << " Ia:" << std::setprecision(3) << c->kalman->received_pu(0)
+                              << "->" << std::setprecision(3) << c->kalman->predicted_pu(0)
+                              << " Va:" << std::setprecision(3) << c->kalman->received_pu(3)
+                              << "->" << std::setprecision(3) << c->kalman->predicted_pu(3);
+                }
+                std::cout << " Latency:" << processing_us << "us\n";
                 set_console_color(COLOR_RESET);
             }
             c->prev_pred_idx = pred_idx;
@@ -371,8 +526,15 @@ int main(int argc, char* argv[]) {
             std::cout << "Dumping features to " << csv_path << " (every " << csv_interval << " packets)\n";
     }
 
+    std::unordered_map<std::string, TimingReconstructor> timing_recons;
     CallbackCtx ctx{&packet_count, class_counts, &true_label, &model,
                     csv_file.is_open() ? &csv_file : nullptr, csv_interval, num_features};
+    ctx.kalman = &kalman_mgr;
+    ctx.timing_recons = &timing_recons;
+    ctx.mitigation_enabled = mitigation_enabled;
+    ctx.flood_sustain = flood_sustain;
+    ctx.flood_recover_rate = flood_recover_rate;
+    ctx.flood_check_interval = flood_check_interval;
     pcap_loop(global_pcap_handle, 0, packet_handler, reinterpret_cast<u_char*>(&ctx));
 
     if (global_pcap_handle) {
