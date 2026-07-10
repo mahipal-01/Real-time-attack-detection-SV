@@ -193,7 +193,7 @@ void fast_parse_sv(const uint8_t* pkt, size_t len, double cap_time, std::vector<
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <interface> [--model s5|s51|rwkv|rwkv1] [--csv <path>] [--csv-interval <N>]\n"
-                  << "       [--mitigation] [--kalman-thresh <F>] [--kalman-Qa <F>] [--kalman-R <F>]\n"
+                  << "       [--mitigation] [--kalman-thresh <F>] [--kalman-Qa <F>] [--kalman-R <F>] [--kalman-harmonics <N>]\n"
                   << "       [--flood-sustain <N>] [--flood-recover-rate <F>] [--flood-check <N>]\n";
         return 1;
     }
@@ -208,6 +208,7 @@ int main(int argc, char* argv[]) {
     double kalman_q_amp = 1e-6;
     double kalman_q_dc = 1e-8;
     double kalman_r_meas = 1e-4;
+    int kalman_harmonics = 6;
     int flood_sustain = 150;
     double flood_recover_rate = 6.0;
     int flood_check_interval = 1000;
@@ -230,6 +231,9 @@ int main(int argc, char* argv[]) {
             kalman_q_amp = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--kalman-R") == 0 && i + 1 < argc) {
             kalman_r_meas = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--kalman-harmonics") == 0 && i + 1 < argc) {
+            kalman_harmonics = std::stoi(argv[++i]);
+            if (kalman_harmonics < 1) kalman_harmonics = 1;
         } else if (strcmp(argv[i], "--flood-sustain") == 0 && i + 1 < argc) {
             flood_sustain = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--flood-recover-rate") == 0 && i + 1 < argc) {
@@ -241,20 +245,18 @@ int main(int argc, char* argv[]) {
     }
 
     std::string model_path;
-    int num_features = 49;
+    int num_features = 52;
     if (model_name == "s5") {
         model_path = "s5_streaming.onnx";
-        num_features = 52;
     } else if (model_name == "rwkv") {
         model_path = "rwkv_streaming.onnx";
-        num_features = 52;
     } else if (model_name == "rwkv1") {
         model_path = "rwkv1_streaming.onnx";
     } else {
         model_path = model_name + "_streaming.onnx";
     }
     OnnxModel model(model_path, 2, 64, num_features);
-    KalmanManager kalman_mgr(kalman_thresh, kalman_q_amp, kalman_q_dc, kalman_r_meas);
+    KalmanManager kalman_mgr(kalman_harmonics, kalman_thresh, kalman_q_amp, kalman_q_dc, kalman_r_meas);
 
     std::signal(SIGINT, signal_handler);
 
@@ -288,7 +290,8 @@ int main(int argc, char* argv[]) {
               << "Mitigation: " << (mitigation_enabled ? "ON" : "OFF") << "\n";
     if (mitigation_enabled) {
         std::cout << "  Kalman: thresh=" << kalman_thresh
-                  << " Qa=" << kalman_q_amp << " R=" << kalman_r_meas << "\n"
+                  << " Qa=" << kalman_q_amp << " R=" << kalman_r_meas
+                  << " harmonics=" << kalman_harmonics << "\n"
                   << "  Flood: sustain=" << flood_sustain
                   << " recover_rate=" << flood_recover_rate
                   << " check_interval=" << flood_check_interval << "\n";
@@ -306,6 +309,7 @@ int main(int argc, char* argv[]) {
         std::ofstream* csv_out;
         int csv_interval;
         int num_features;
+        std::string model_name;
         double proc_sum = 0;
         uint64_t proc_count = 0;
         double proc_max = 0;
@@ -379,7 +383,8 @@ int main(int argc, char* argv[]) {
                 rec.capture_time_sec, rec.smpSynch,
                 rec.refrTm[7],
                 mac_to_string(rec.src_mac),
-                features, c->num_features
+                features, c->num_features,
+                c->model_name
             );
             auto t_feat_end = clock::now();
             double feat_us = std::chrono::duration<double, std::micro>(t_feat_end - t_feat_start).count();
@@ -528,7 +533,7 @@ int main(int argc, char* argv[]) {
 
     std::unordered_map<std::string, TimingReconstructor> timing_recons;
     CallbackCtx ctx{&packet_count, class_counts, &true_label, &model,
-                    csv_file.is_open() ? &csv_file : nullptr, csv_interval, num_features};
+                    csv_file.is_open() ? &csv_file : nullptr, csv_interval, num_features, model_name};
     ctx.kalman = &kalman_mgr;
     ctx.timing_recons = &timing_recons;
     ctx.mitigation_enabled = mitigation_enabled;

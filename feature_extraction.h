@@ -31,6 +31,18 @@ constexpr double SCALER_SCALE[5] = {
 constexpr int SCALED_INDICES[5] = {5, 4, 3, 6, 7};
 
 // v3 scaler (8 features)
+// scaler1 (from models/scaler1.pt, for new s51/rwkv1 52-feat models)
+constexpr double SCALER_MEAN_NEW[8] = {
+    0.2242530122839307, 12.701893024273886, 0.9678583490589433,
+    0.2242530540011254, 43.84924390717951, 1.5135318972052896,
+    4.166814377106583e-08, 9.159324295167629
+};
+constexpr double SCALER_SCALE_NEW[8] = {
+    14.46864063075715, 102.11618966070623, 178.45302222841997,
+    0.5843675654851607, 198.33999174452433, 10.816705544044106,
+    14.460259932237058, 11.9739314975329
+};
+
 constexpr double SCALER_MEAN_V3[8] = {
     0.21896841433281414, 13.397994228683862,
     0.9353995426428497, 0.21896794192210542,
@@ -122,6 +134,7 @@ void compute_features(
     int smpCnt, double refrTm, double forwardTime,
     int smpSynch, int refrTmQuality,
     const std::string& src_mac,
-    float out_features[], int num_features = 49);
+    float out_features[], int num_features = 49,
+    const std::string& model_name = "s51");
 
 extern std::string g_baseline_src;

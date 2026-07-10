@@ -60,7 +60,8 @@ void compute_features(
     int smpCnt, double refrTm, double forwardTime,
     int smpSynch, int refrTmQuality,
     const std::string& src_mac,
-    float out_features[], int num_features)
+    float out_features[], int num_features,
+    const std::string& model_name)
 {
     static StreamState s;
 
@@ -304,13 +305,21 @@ void compute_features(
         f[51] = std::min(80.0 / span, 500.0);
     }
 
-    // Scaler normalization (v2 or v3 depending on feature count)
-    if (num_features == NUM_FEATURES_V3) {
+    // Scaler normalization (model-dependent)
+    if (model_name == "s51" || model_name == "rwkv1") {
+        // New 52-feature models: use scaler1 from models/scaler1.pt
+        for (int i = 0; i < 8; ++i) {
+            int idx = SCALED_INDICES_V3[i];
+            f[idx] = (f[idx] - SCALER_MEAN_NEW[i]) / SCALER_SCALE_NEW[i];
+        }
+    } else if (num_features == NUM_FEATURES_V3) {
+        // Existing v3 models (s5, rwkv): use existing v3 scaler
         for (int i = 0; i < 8; ++i) {
             int idx = SCALED_INDICES_V3[i];
             f[idx] = (f[idx] - SCALER_MEAN_V3[i]) / SCALER_SCALE_V3[i];
         }
     } else {
+        // 49-feature models (legacy): use v2 scaler
         for (int i = 0; i < 5; ++i) {
             int idx = SCALED_INDICES[i];
             f[idx] = (f[idx] - SCALER_MEAN[i]) / SCALER_SCALE[i];
